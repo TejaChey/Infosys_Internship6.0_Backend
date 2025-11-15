@@ -1,11 +1,18 @@
 import io
+import hashlib
 from typing import Dict, Any
 from PIL import Image, UnidentifiedImageError
 from rapidfuzz import fuzz
 from .db import documents_collection
-from .utils import sha256_hex
-from .verification import verify_aadhaar_local, verify_pan_local
+import numpy as np
 
+# Try to import cv2 for a robust Laplacian-based sharpness check; fall back gracefully.
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+# Weights for heuristics; tune as needed.
 _WEIGHTS = {
     "aadhaar_invalid": 40,
     "pan_invalid": 30,
@@ -15,7 +22,7 @@ _WEIGHTS = {
 }
 
 def _is_duplicate(file_hash: str, parsed: Dict[str, Any], user_id: str) -> bool:
-    # duplicate by file OR by Aadhaar/PAN number across *any* user
+    # duplicate by file hash (any document except same id) OR by Aadhaar/PAN used by other users
     if documents_collection.find_one({"fileHash": file_hash}):
         return True
     aid = parsed.get("aadhaarNumber")
@@ -26,6 +33,18 @@ def _is_duplicate(file_hash: str, parsed: Dict[str, Any], user_id: str) -> bool:
     if q and documents_collection.find_one({"$or": q, "userId": {"$ne": str(user_id)}}):
         return True
     return False
+
+def _compute_sharpness_cv2(gray: np.ndarray) -> float:
+    # Laplacian variance is a common measure for blur: higher -> sharper
+    lap = cv2.Laplacian(gray, cv2.CV_64F)
+    return float(lap.var())
+
+def _compute_sharpness_fallback(gray: np.ndarray) -> float:
+    # Approximate by variance of gradients (numpy)
+    gx = np.diff(gray, axis=1)
+    gy = np.diff(gray, axis=0)
+    grad = np.concatenate([gx.flatten(), gy.flatten()]) if gx.size + gy.size > 0 else np.array([0.0])
+    return float(np.var(grad))
 
 def _detect_manipulation(file_bytes: bytes) -> bool:
     try:
@@ -43,18 +62,21 @@ def analyze_for_fraud(user: Dict[str, Any], file_bytes: bytes, parsed: Dict[str,
     details: Dict[str, Any] = {}
     score = 0.0
 
-    file_hash = sha256_hex(file_bytes)
+    # compute sha256 locally
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
     details["fileHash"] = file_hash
 
-    # Local validations
+    # Local validations (lazy import to avoid circular import at module load)
+    from . import verification as _verification
+
     aadhaar = parsed.get("aadhaarNumber")
     if aadhaar is not None:
-        ok = verify_aadhaar_local(aadhaar)
+        ok = _verification.verify_aadhaar_local(aadhaar)
         details["aadhaar_valid_local"] = ok
         if not ok: score += _WEIGHTS["aadhaar_invalid"]
     pan = parsed.get("panNumber")
     if pan is not None:
-        okp = verify_pan_local(pan)
+        okp = _verification.verify_pan_local(pan)
         details["pan_valid_local"] = okp
         if not okp: score += _WEIGHTS["pan_invalid"]
 
