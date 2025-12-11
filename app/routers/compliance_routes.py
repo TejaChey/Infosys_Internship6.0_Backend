@@ -8,7 +8,7 @@ from io import BytesIO
 # Keep original relative imports (this file lives in app/routers/)
 from ..compliance import run_full_pipeline, check_duplicate, aml_check_aadhaar
 from ..security import get_current_user
-from ..db import alerts_collection, audit_logs_collection, documents_collection, aml_blacklist_collection, kyc_data_collection
+from ..db import alerts_collection, audit_logs_collection, documents_collection, aml_blacklist_collection, kyc_data_collection, users_collection
 from ..config import settings
 import jwt
 
@@ -21,14 +21,17 @@ router = APIRouter(prefix="/compliance", tags=["compliance"])
 @router.get("/docs", response_model=List[Dict[str, Any]])
 def list_user_docs(current_user=Depends(get_current_user)):
     """
-    Return documents uploaded by the current user.
-    If auth is not enforced in testing, returns all documents as fallback.
+    Return documents uploaded by the current user ONLY.
+    This applies to ALL users including admins.
+    Admins can use the /submissions endpoint (Admin Panel) to see all users' docs.
     """
     try:
         user_id = None
+        user_email = None
         try:
-            if isinstance(current_user, dict) and "_id" in current_user:
-                user_id = str(current_user["_id"])
+            if isinstance(current_user, dict):
+                user_id = str(current_user.get("_id", ""))
+                user_email = current_user.get("email", "")
             elif hasattr(current_user, "id"):
                 user_id = str(current_user.id)
             elif hasattr(current_user, "_id"):
@@ -38,13 +41,15 @@ def list_user_docs(current_user=Depends(get_current_user)):
         except Exception:
             user_id = None
 
-        if current_user.get("role") == "admin":
-            # Admins see ALL documents for monitoring
-            docs = list(documents_collection.find().sort("createdAt", -1))
-        elif user_id:
+        # ALWAYS filter by current user - admins see their own docs in Submissions tab
+        # They use Admin Panel for viewing all users' submissions
+        if user_id:
             docs = list(documents_collection.find({"userId": user_id}).sort("createdAt", -1))
+        elif user_email:
+            docs = list(documents_collection.find({"userEmail": user_email}).sort("createdAt", -1))
         else:
-            docs = list(documents_collection.find().sort("createdAt", -1))
+            # No user context - return empty for security
+            docs = []
 
         # normalize _id to string
         out = []
@@ -368,8 +373,24 @@ def list_submissions(current_user=Depends(get_current_user)):
         else:
             source = 'kyc'
 
+        # Cache user roles for efficiency
+        user_roles_cache = {}
+        
+        def get_user_role(user_email):
+            if not user_email:
+                return 'user'
+            if user_email in user_roles_cache:
+                return user_roles_cache[user_email]
+            user = users_collection.find_one({"email": user_email})
+            role = user.get('role', 'user') if user else 'user'
+            user_roles_cache[user_email] = role
+            return role
+
         out = []
         for d in docs:
+            user_email = d.get('userEmail')
+            user_role = get_user_role(user_email)
+            
             if source == 'kyc':
                 doc_id = str(d.get('docId') or '')
                 doc_obj = None
@@ -380,22 +401,26 @@ def list_submissions(current_user=Depends(get_current_user)):
                     doc_obj = documents_collection.find_one({"_id": doc_id})
                 record = {
                     'docId': doc_id,
-                    'userEmail': d.get('userEmail'),
+                    'userEmail': user_email,
+                    'userRole': user_role,
                     'filename': (doc_obj or {}).get('filename') if doc_obj else d.get('verification', {}).get('filename'),
                     'docType': d.get('docType'),
                     'createdAt': d.get('createdAt'),
                     'decision': d.get('decision'),
                     'fraud': d.get('fraud', {}),
+                    'verification': d.get('verification', {}),
                 }
             else:
                 record = {
                     'docId': str(d.get('_id')),
-                    'userEmail': d.get('userEmail'),
+                    'userEmail': user_email,
+                    'userRole': user_role,
                     'filename': d.get('filename'),
                     'docType': d.get('docType'),
                     'createdAt': d.get('createdAt'),
                     'decision': d.get('decision'),
                     'fraud': d.get('fraud', {}),
+                    'verification': d.get('verification', {}),
                 }
             out.append(record)
         return out

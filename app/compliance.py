@@ -88,28 +88,126 @@ def run_full_pipeline(user: Dict[str, Any], filename: str, file_bytes: bytes, de
     cnn_score = None
     gnn_score = None
     
-    # Pre-calculate connections for GNN
-    connection_count = 0
+    # === ENHANCED GNN: Build Duplicate Network Graph ===
+    # Nodes = Users, Edges = Shared identifiers (Aadhaar, PAN, DL, email, device)
+    
+    graph_edges = {
+        "shared_aadhaar": set(),      # Users with same Aadhaar
+        "shared_pan": set(),          # Users with same PAN
+        "shared_dl": set(),           # Users with same DL
+        "shared_email": set(),        # Users with same email domain pattern (fraud rings)
+        "shared_device": set(),       # Users from same device fingerprint
+    }
+    
+    current_user_id = str(user.get("_id", ""))
+    current_user_email = user.get("email", "")
+    
+    # 1. Pre-scan document for identifiers (quick OCR check)
+    try:
+        from .verification import verify_document
+        from .pdf_utils import convert_pdf_to_image
+        
+        converted = convert_pdf_to_image(file_bytes)
+        temp_parsed = verify_document(converted if converted else file_bytes).get("parsed", {})
+        
+        extracted_aadhaar = temp_parsed.get("aadhaarNumber")
+        extracted_pan = temp_parsed.get("panNumber")
+        extracted_dl = temp_parsed.get("dlNumber")
+        
+        # Check for shared Aadhaar (different users, same Aadhaar = FRAUD)
+        if extracted_aadhaar:
+            aadhaar_matches = documents_collection.find(
+                {"parsed.aadhaarNumber": extracted_aadhaar, "userId": {"$ne": current_user_id}},
+                {"userId": 1, "userEmail": 1}
+            )
+            for doc in aadhaar_matches:
+                graph_edges["shared_aadhaar"].add(str(doc.get("userId", "")))
+        
+        # Check for shared PAN
+        if extracted_pan:
+            pan_matches = documents_collection.find(
+                {"parsed.panNumber": extracted_pan, "userId": {"$ne": current_user_id}},
+                {"userId": 1}
+            )
+            for doc in pan_matches:
+                graph_edges["shared_pan"].add(str(doc.get("userId", "")))
+        
+        # Check for shared DL
+        if extracted_dl:
+            dl_matches = documents_collection.find(
+                {"parsed.dlNumber": extracted_dl, "userId": {"$ne": current_user_id}},
+                {"userId": 1}
+            )
+            for doc in dl_matches:
+                graph_edges["shared_dl"].add(str(doc.get("userId", "")))
+        
+    except Exception as e:
+        print(f"⚠️ Pre-scan for GNN edges failed: {e}")
+    
+    # 2. Check for shared device fingerprint
     if device_info and device_info.get("hash"):
-        # Check how many OTHER users used this device
         d_hash = device_info.get("hash")
-        existing_docs = documents_collection.find({"deviceInfo.hash": d_hash}, {"userId": 1})
-        users_on_device = set(str(d["userId"]) for d in existing_docs)
-        if str(user.get("_id")) in users_on_device:
-            users_on_device.remove(str(user.get("_id")))
-        connection_count = len(users_on_device)
-
+        device_matches = documents_collection.find(
+            {"deviceInfo.hash": d_hash, "userId": {"$ne": current_user_id}},
+            {"userId": 1}
+        )
+        for doc in device_matches:
+            graph_edges["shared_device"].add(str(doc.get("userId", "")))
+    
+    # 3. Check for same email pattern (e.g., fraud rings: user1@tempmail.com, user2@tempmail.com)
+    if current_user_email and "@" in current_user_email:
+        email_domain = current_user_email.split("@")[1].lower()
+        suspicious_domains = ["tempmail", "guerrilla", "10minute", "throwaway", "fake", "mailinator"]
+        
+        if any(sus in email_domain for sus in suspicious_domains):
+            # Find other users with same suspicious domain
+            from .db import users_collection
+            similar_emails = users_collection.find(
+                {"email": {"$regex": f"@{email_domain}$", "$options": "i"}, "_id": {"$ne": user.get("_id")}},
+                {"_id": 1}
+            )
+            for u in similar_emails:
+                graph_edges["shared_email"].add(str(u.get("_id", "")))
+    
+    # 4. Calculate total connections for GNN
+    all_connected_users = set()
+    edge_weights = {
+        "shared_aadhaar": 5.0,    # Highest risk - identity theft
+        "shared_pan": 4.0,        # High risk - financial fraud
+        "shared_dl": 3.0,         # Medium-high risk
+        "shared_device": 2.0,     # Medium risk - could be shared computer
+        "shared_email": 1.0,      # Lower risk - suspicious but not definitive
+    }
+    
+    total_edge_weight = 0.0
+    for edge_type, user_set in graph_edges.items():
+        all_connected_users.update(user_set)
+        total_edge_weight += len(user_set) * edge_weights[edge_type]
+    
+    connection_count = len(all_connected_users)
+    
+    # Calculate risk score based on edge types
+    risk_score = min(1.0, total_edge_weight / 10.0)  # Normalize to 0-1
+    
     try:
         from .ml_integration import predict_cnn_manipulation, predict_gnn_fraud
         
         # Run CNN
         cnn_score = predict_cnn_manipulation(file_bytes)
         
-        # Run GNN (Dynamic Graph Construction)
+        # Run GNN (Dynamic Graph with meaningful edges)
         gnn_input = {
             "connections": connection_count,
-            "risk_score": 0.5 if connection_count > 0 else 0.1, # Initial heuristic
-            "features": []
+            "risk_score": risk_score,
+            "edge_types": {k: len(v) for k, v in graph_edges.items()},  # Pass edge breakdown
+            "features": [
+                len(graph_edges["shared_aadhaar"]),
+                len(graph_edges["shared_pan"]),
+                len(graph_edges["shared_dl"]),
+                len(graph_edges["shared_device"]),
+                len(graph_edges["shared_email"]),
+                risk_score,
+            ]
         }
         gnn_score = predict_gnn_fraud(gnn_input)
         

@@ -117,58 +117,103 @@ def predict_cnn_manipulation(image_bytes: bytes):
 
 def predict_gnn_fraud(graph_data_dict: dict):
     """
-    Run GNN on a dynamically constructed graph.
+    Run GNN on a dynamically constructed Duplicate Network Graph.
+    
+    Graph Structure:
+    - Nodes: Users (current user + connected users from duplicate detection)
+    - Edges: Connections based on shared identifiers
+        - shared_aadhaar (weight 5.0) - Identity theft indicator
+        - shared_pan (weight 4.0) - Financial fraud indicator  
+        - shared_dl (weight 3.0) - Document fraud indicator
+        - shared_device (weight 2.0) - Shared device indicator
+        - shared_email (weight 1.0) - Suspicious email pattern
+    
     Args:
-        graph_data_dict: Contains metadata to build features/edges
-           - 'connections': int (number of shared device links)
-           - 'risk_score': float (heuristic risk)
-           - 'features': list (optional custom features)
+        graph_data_dict: Contains:
+           - 'connections': int (total unique connected users)
+           - 'risk_score': float (weighted risk from edge types)
+           - 'edge_types': dict (breakdown of connections by type)
+           - 'features': list (custom features for node embedding)
     """
     if gnn_model is None: return 0.0
 
     try:
-        # 1. Feature Engineering (Map to size 16 vector)
-        # We construct a feature vector based on real inputs + padding
+        # 1. Extract edge type counts
+        edge_types = graph_data_dict.get('edge_types', {})
         connections = graph_data_dict.get('connections', 0)
         risk = graph_data_dict.get('risk_score', 0)
+        custom_features = graph_data_dict.get('features', [])
         
-        # Feature Vector [Risk, Connections, ...zeros...]
-        feat_vec = [risk, float(connections)] + [0.0] * 14 # Pad to 16
+        # 2. Build Feature Vector (16 dimensions)
+        # [aadhaar_count, pan_count, dl_count, device_count, email_count, risk_score, ...]
+        feat_vec = [
+            float(edge_types.get('shared_aadhaar', 0)),
+            float(edge_types.get('shared_pan', 0)),
+            float(edge_types.get('shared_dl', 0)),
+            float(edge_types.get('shared_device', 0)),
+            float(edge_types.get('shared_email', 0)),
+            float(risk),
+            float(connections),
+        ]
+        # Pad remaining features
+        feat_vec += custom_features[:9] if custom_features else [0.0] * 9
+        feat_vec = feat_vec[:16]  # Ensure exactly 16 features
         
-        # Create Tensor
-        x = torch.tensor([feat_vec], dtype=torch.float32) # Single node for current user
+        # Create Tensor for current user
+        x = torch.tensor([feat_vec], dtype=torch.float32)
         
-        # Create Edges
-        # If user has connections (from MongoDB check), we simulate an edge to a "Ghost Node"
-        # Since GNN layer conv2 output dimension is 2 (Not Fraud/Fraud), it expects a graph.
+        # 3. Create Graph Edges based on duplicate types
+        num_neighbors = min(connections, 5)  # Cap at 5 for performance
         
-        # For simplicity in this demo: Self-loop or Star graph based on 'connections' count.
-        # If connections > 0, we add random neighbor nodes to represent the "Ring".
-        
-        num_neighbors = min(connections, 5) # Cap at 5 for performance
         if num_neighbors > 0:
-            # Create feature vectors for neighbors (random/high risk)
-            x_neighbors = torch.randn((num_neighbors, 16))
-            x = torch.cat([x, x_neighbors], dim=0)
+            # Create feature vectors for neighbors based on their edge type
+            neighbor_features = []
             
-            # Create edges (Center <-> Neighbors)
-            src = [0] * num_neighbors + list(range(1, num_neighbors+1))
-            dst = list(range(1, num_neighbors+1)) + [0] * num_neighbors
-            edge_index = torch.tensor([src, dst], dtype=torch.long)
+            # Add neighbors with edge-type-specific features
+            neighbor_idx = 0
+            for edge_type, weight in [
+                ('shared_aadhaar', 5.0), 
+                ('shared_pan', 4.0),
+                ('shared_dl', 3.0),
+                ('shared_device', 2.0),
+                ('shared_email', 1.0)
+            ]:
+                count = edge_types.get(edge_type, 0)
+                for _ in range(min(count, num_neighbors - neighbor_idx)):
+                    if neighbor_idx >= num_neighbors:
+                        break
+                    # Create neighbor feature with emphasis on their edge type
+                    n_feat = [0.0] * 16
+                    n_feat[['shared_aadhaar', 'shared_pan', 'shared_dl', 'shared_device', 'shared_email'].index(edge_type)] = weight
+                    n_feat[5] = weight / 5.0  # Normalized risk
+                    neighbor_features.append(n_feat)
+                    neighbor_idx += 1
+            
+            if neighbor_features:
+                x_neighbors = torch.tensor(neighbor_features, dtype=torch.float32)
+                x = torch.cat([x, x_neighbors], dim=0)
+                
+                # Create bidirectional edges (center <-> each neighbor)
+                src = [0] * len(neighbor_features) + list(range(1, len(neighbor_features) + 1))
+                dst = list(range(1, len(neighbor_features) + 1)) + [0] * len(neighbor_features)
+                edge_index = torch.tensor([src, dst], dtype=torch.long)
+            else:
+                # Self-loop if no valid neighbors
+                edge_index = torch.tensor([[0], [0]], dtype=torch.long)
         else:
             # Single node, self loop
             edge_index = torch.tensor([[0], [0]], dtype=torch.long)
             
         data = Data(x=x, edge_index=edge_index)
         
-        # Predict
+        # 4. Predict
         with torch.no_grad():
             out = gnn_model(data)
-            # out is log_softmax -> [log(prob_safe), log(prob_fraud)]
+            # out is log_softmax -> [log(prob_safe), log(prob_fraud)] for each node
             # We take index 0 (current user)
             user_out = out[0] 
-            prob = torch.exp(user_out) # Convert log_prob to prob
-            fraud_prob = prob[1].item() # Probability of Class 1 (Fraud)
+            prob = torch.exp(user_out)  # Convert log_prob to prob
+            fraud_prob = prob[1].item()  # Probability of Class 1 (Fraud)
             
             return fraud_prob
             
